@@ -1,1 +1,1 @@
-com.examplus
+com.mycompany.webtoapp
