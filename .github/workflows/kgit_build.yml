@@ -1,4 +1,5 @@
 # Installed by K-Git Studio. Run it from the Builds tab.
+# kgit-workflow-version: 7
 name: K-Git Build
 
 on:
@@ -48,7 +49,7 @@ jobs:
           if [ ! -d android ]; then
             # app_package.txt (one line, for example com.company.app) is the single place the package name lives.
             PKG="$(tr -d '[:space:]' < app_package.txt 2>/dev/null || true)"
-            if ! echo "$PKG" | grep -Eq '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$'; then PKG="com.example.app"; fi
+            if ! echo "$PKG" | grep -Eq '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$'; then PKG="com.ahmam.examplus"; fi
             flutter create --platforms=android --project-name "${PKG##*.}" --org "${PKG%.*}" /tmp/kgit_scaffold
             cp -r /tmp/kgit_scaffold/android ./android
             # App name: app_name.txt (one line) is the single place it lives. Without it, the pubspec name is title-cased.
@@ -62,6 +63,93 @@ jobs:
               echo "App name: $NAME"
             fi
           fi
+
+      - name: Network resilience (Maven Central mirror, longer timeouts, retries)
+        run: |
+          # Some downloads (for example Kotlin compiler jars) are redirected to github.com release
+          # pages, which time out on busy days. Use Google's Maven Central mirror when it answers,
+          # and give Gradle longer timeouts and more retries.
+          mkdir -p "$HOME/.gradle/init.d"
+          {
+            echo "systemProp.org.gradle.internal.http.connectionTimeout=180000"
+            echo "systemProp.org.gradle.internal.http.socketTimeout=300000"
+            echo "systemProp.org.gradle.internal.repository.max.retries=8"
+            echo "systemProp.org.gradle.internal.repository.initial.backoff=3000"
+          } >> "$HOME/.gradle/gradle.properties"
+          MIRROR="https://maven-central.storage-download.googleapis.com/maven2/"
+          if curl -fsI --max-time 20 "${MIRROR}org/jetbrains/kotlin/kotlin-stdlib/2.0.0/kotlin-stdlib-2.0.0.pom" >/dev/null; then
+            cat > "$HOME/.gradle/init.d/kgit-mirror.gradle" <<'GRADLE'
+          def mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+          def fix = { repos ->
+            repos.all { r ->
+              if (r instanceof MavenArtifactRepository && r.url != null && r.url.toString().contains('repo.maven.apache.org')) {
+                r.url = mirror
+              }
+            }
+          }
+          gradle.settingsEvaluated { s ->
+            fix(s.pluginManagement.repositories)
+          }
+          gradle.allprojects { p ->
+            fix(p.repositories)
+            fix(p.buildscript.repositories)
+          }
+          GRADLE
+            echo "Using the Maven Central mirror."
+          else
+            echo "Mirror not reachable; using Maven Central directly."
+          fi
+
+      - name: Fetch Gradle with retries (GitHub release downloads sometimes return 504)
+        run: |
+          props=android/gradle/wrapper/gradle-wrapper.properties
+          if [ -f "$props" ]; then
+            url="$(grep '^distributionUrl=' "$props" | head -1 | cut -d= -f2- | sed 's#\\:#:#g')"
+            name="$(basename "$url")"
+            ver="$(echo "$name" | sed -E 's/^gradle-(.*)-(all|bin)\.zip$/\1/')"
+            bin="gradle-${ver}-bin.zip"
+            ok=0
+            for src in "https://downloads.gradle.org/distributions/$bin" "https://services.gradle.org/distributions/$bin" "https://github.com/gradle/gradle-distributions/releases/download/v${ver}/$bin"; do
+              echo "Trying $src"
+              if curl -fL --retry 6 --retry-all-errors --retry-delay 10 --connect-timeout 30 -o "/tmp/$bin" "$src" && unzip -tq "/tmp/$bin" >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+            done
+            if [ "$ok" = "1" ]; then
+              grep -v '^distributionUrl=\|^distributionSha256Sum=' "$props" > /tmp/gw.properties
+              printf 'distributionUrl=file\\:///tmp/%s\n' "$bin" >> /tmp/gw.properties
+              cp /tmp/gw.properties "$props"
+              echo "Gradle $ver downloaded and used from /tmp/$bin"
+            else
+              echo "::warning::Could not pre-download Gradle; the wrapper will try by itself."
+            fi
+          fi
+
+      - name: Make Gradle fit the runner (memory, workers, swap, NDK and CMake)
+        run: |
+          # Private repositories get a small runner (about 7 GB). Flutter's default
+          # 8 GB Gradle heap makes the runner run out of memory and get shut down.
+          sudo fallocate -l 4G /swapfile || true
+          sudo chmod 600 /swapfile || true
+          sudo mkswap /swapfile >/dev/null 2>&1 || true
+          sudo swapon /swapfile || true
+          touch android/gradle.properties
+          sed -i '/^org\.gradle\.jvmargs=/d;/^org\.gradle\.workers\.max=/d;/^org\.gradle\.daemon=/d;/^kotlin\.daemon\.jvmargs=/d;/^org\.gradle\.parallel=/d' android/gradle.properties
+          {
+            echo "org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -XX:+HeapDumpOnOutOfMemoryError"
+            echo "kotlin.daemon.jvmargs=-Xmx1g"
+            echo "org.gradle.workers.max=2"
+            echo "org.gradle.parallel=false"
+            echo "org.gradle.daemon=false"
+          } >> android/gradle.properties
+          # Download the native tools now, so the build itself does not stall on them.
+          SDKM="${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+            "$SDKM" "cmake;3.22.1" "ndk;28.2.13676358" >/dev/null 2>&1 || true
+          fi
+          free -m | head -2
 
       - name: Wire Android permissions (app_permissions.txt, or detected from pubspec.yaml)
         run: |
@@ -142,6 +230,36 @@ jobs:
                   if n != t:
                       f.write_text(n, encoding="utf-8")
                       print("Fingerprint: patched", f)
+          PYCODE
+
+      - name: Wire AdMob (app_admob_id.txt holds the AdMob App ID)
+        run: |
+          if [ ! -f app_admob_id.txt ]; then
+            if grep -q google_mobile_ads pubspec.yaml; then
+              echo "::error::This app uses google_mobile_ads but app_admob_id.txt is missing. Put your AdMob App ID (ca-app-pub-123~456) in that file."
+              exit 1
+            fi
+            echo 'No AdMob in this app. Skipping.'
+            exit 0
+          fi
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          lines = [l.strip() for l in Path("app_admob_id.txt").read_text(encoding="utf-8").splitlines() if l.strip()]
+          app_id = lines[0] if lines else ""
+          if not re.fullmatch(r"ca-app-pub-\d+~\d+", app_id):
+              raise SystemExit("app_admob_id.txt must hold an AdMob App ID like ca-app-pub-1234567890123456~1234567890")
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          content = manifest.read_text(encoding="utf-8")
+          if "com.google.android.gms.ads.APPLICATION_ID" in content:
+              print("AdMob App ID already in the manifest.")
+          else:
+              tag = '    <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="' + app_id + '"/>\n'
+              if "</application>" not in content:
+                  raise SystemExit("Could not find </application> in the manifest.")
+              content = content.replace("</application>", tag + "    </application>", 1)
+              manifest.write_text(content, encoding="utf-8")
+              print("Added the AdMob App ID to the manifest.")
           PYCODE
 
       - name: Set Android compile SDK to API 36
@@ -227,6 +345,21 @@ jobs:
           else
             echo "::warning::Signing secrets are not all set. This build is NOT signed with your release key."
           fi
+
+      - name: AAB needs the real release key
+        if: ${{ inputs.build_type == 'aab' || inputs.build_type == 'both' }}
+        env:
+          KEY_KIND: ${{ secrets.ANDROID_KEYSTORE_KIND }}
+        run: |
+          if [ "${KGIT_SIGNED:-}" != "true" ]; then
+            echo "::error::An AAB for Google Play must be signed with your real release key, but the four signing secrets (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD) are not all set. Open Release Signing in K-Git Studio, add them, then build again. An APK can still be built without them for testing."
+            exit 1
+          fi
+          if [ "${KEY_KIND:-}" = "test" ]; then
+            echo "::error::The signing key in this repository is a TEST key (its password is the package name). It must never be used for Google Play. Create a release key or upload your own in Release Signing, then build the AAB again."
+            exit 1
+          fi
+          echo "Release key found. Building the AAB with it."
 
       - name: Configure release signing
         if: ${{ env.KGIT_SIGNED == 'true' }}
@@ -417,6 +550,11 @@ jobs:
                   continue
               original = gradle_file.read_text(encoding="utf-8")
               updated, count = pattern.subn(r"\g<1>36\g<2>", original)
+              # AGP 9 refuses the old default ProGuard file that some plugins still name.
+              fixed = updated.replace("proguard-android.txt", "proguard-android-optimize.txt")
+              if fixed != updated:
+                  updated = fixed
+                  count += 1
               if count:
                   gradle_file.write_text(updated, encoding="utf-8")
                   changed.append(gradle_file)
@@ -444,6 +582,16 @@ jobs:
           for item in changed:
               print(f"  - {item}")
           PYCODE
+
+      - name: Check the AdMob App ID is in the manifest
+        run: |
+          if grep -q google_mobile_ads pubspec.yaml; then
+            if ! grep -q "com.google.android.gms.ads.APPLICATION_ID" android/app/src/main/AndroidManifest.xml; then
+              echo "::error::google_mobile_ads is in this app but the AdMob App ID is not in AndroidManifest.xml. The app would close right after opening. Stopping the build."
+              exit 1
+            fi
+            echo "AdMob App ID is in the manifest."
+          fi
 
       - name: Analyze (non-blocking)
         run: flutter analyze
