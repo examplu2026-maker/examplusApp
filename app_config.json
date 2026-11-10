@@ -6,7 +6,7 @@
   "open_links_externally": "auto",
   "new_window_mode": "in_app",
   "enable_downloads": true,
-  "enable_print": false,
+  "enable_print": true,
   "enable_share": false,
   "adapt_width": false,
   "allow_zoom": false,
