@@ -1,2 +1,0 @@
-# Required for website content and Android's native Download Manager.
-android.permission.INTERNET
